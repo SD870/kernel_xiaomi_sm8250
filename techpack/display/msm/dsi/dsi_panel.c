@@ -951,7 +951,6 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		return 0;
 
         if (bl_lvl > 0)
-                bl_lvl = ea_panel_calc_backlight(bl_lvl < bl_dc_min ? bl_dc_min : bl_lvl);
 
 	DSI_INFO("backlight type:%d lvl:%d\n", bl->type, bl_lvl);
 
