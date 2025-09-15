@@ -85,6 +85,9 @@ if [ -n  "$*" ]; then
     psyche)
       DEVICE=$1;
     ;;
+    pipa)
+      DEVICE=$1;
+    ;;
   esac
 
   echo "================================================="
@@ -137,7 +140,7 @@ HEAD of the project used to prepare this commit:
 ${KERNEL_DEFCONFIG_URL}/tree/${KERNEL_DEFCONFIG_HEAD}
 EOM
 
-  DEVICES="alioth apollo cas cmi dagu elish enuma lmi munch umi thyme psyche"
+  DEVICES="alioth apollo cas cmi dagu elish enuma lmi munch umi thyme psyche pipa"
 
   for device in $DEVICES; do \
 
@@ -176,6 +179,9 @@ EOM
         DEVICE=$device;
       ;;
       psyche)
+        DEVICE=$device;
+      ;;
+      pipa)
         DEVICE=$device;
       ;;
     esac
