@@ -1499,10 +1499,11 @@ static int bq2597x_get_dev_role(struct i2c_client *client)
 		return -EINVAL;
 	}
 
-	dev_info(&client->dev, "%s: matched to %s, dev_role: %d.\n",
-			__func__, of_id->compatible, (int)of_id->data);
+	dev_info(&client->dev, "%s: matched to %s, dev_role: %d\n",
+		 __func__, of_id->compatible,
+		 (int)(uintptr_t)of_id->data);
 
-	return (int)of_id->data;
+	return (int)(uintptr_t)of_id->data;
 }
 
 static int bq2597x_parse_dt(struct bq2597x *bq, struct device *dev)
