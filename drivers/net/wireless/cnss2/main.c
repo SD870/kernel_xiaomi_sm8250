@@ -416,6 +416,37 @@ static int cnss_request_antenna_sharing(struct cnss_plat_data *plat_priv)
 {
 	int ret = 0;
 
+	/*
+	 * ANTENNA-FIX for pipa (Xiaomi Pad 6 — WiFi-only, no modem):
+	 *
+	 * This function implements WLAN↔Modem RF antenna sharing via the
+	 * QMI COEX service (service ID 0x22, "switch_to_wlan/switch_to_mdm").
+	 * It is NOT related to Bluetooth — BT coex on QCA6390 is handled
+	 * internally via PTA, completely separate from this path.
+	 *
+	 * On a WiFi-only device:
+	 *   - CNSS_COEX_CONNECTED is never set (no modem QMI service)
+	 *   - cnss_wlfw_antenna_switch_send_sync() returns err 94
+	 *     (QMI_ERR_NOT_SUPPORTED_V01) — firmware says "I own all
+	 *     antennas, no modem to coordinate with"
+	 *   - The -1 return is ignored by our caller (cnss_fw_ready_hdlr)
+	 *   - cnss_wlfw_antenna_grant_send_sync() is never called
+	 *   - Firmware never receives a grant → MAC layer stuck "not ready"
+	 *   - cnss_wait_for_wlfw_mac_ready() spins 200×50ms → 10s timeout
+	 *
+	 * Fix: if COEX service is not connected (no modem present), skip
+	 * the entire sharing flow and return success.  The firmware that
+	 * said "not supported" already owns its antennas unconditionally.
+	 * Sending ~0ULL as a fake grant would be wrong — the grant bitmask
+	 * is specifically for modem antenna chain arbitration and sending
+	 * garbage bits could confuse the firmware.
+	 */
+	if (!test_bit(CNSS_COEX_CONNECTED, &plat_priv->driver_state) &&
+	    !plat_priv->antenna) {
+		cnss_pr_info("ANTENNA-FIX: no modem COEX service — skipping antenna sharing (WiFi-only device)\n");
+		return 0;
+	}
+
 	if (!plat_priv->antenna) {
 		ret = cnss_wlfw_antenna_switch_send_sync(plat_priv);
 		if (ret)
@@ -1068,6 +1099,24 @@ static void cnss_recovery_work_handler(struct work_struct *work)
 	if (!plat_priv->recovery_enabled)
 		panic("subsys-restart: Resetting the SoC wlan crashed\n");
 
+	/*
+	 * RACE2 FIX: drain event_wq before MHI shutdown.
+	 *
+	 * This handler runs on system_wq.  When the firmware crashes,
+	 * the IPC router delivers wlfw_del_server() + wlfw_new_server()
+	 * (new firmware restarting immediately) to event_wq — potentially
+	 * before this handler runs.  Without the flush, cnss_bus_dev_shutdown()
+	 * would tear down MHI right in the middle of the BDF download that
+	 * event_wq is servicing for the new session, causing the new firmware
+	 * to crash again → 825-restart death spiral.
+	 *
+	 * flush_workqueue() blocks until all work items currently queued on
+	 * event_wq have completed, guaranteeing that any in-flight SERVER_ARRIVE
+	 * + BDF download sequence finishes (or fails cleanly) before we pull
+	 * the rug out from under it.
+	 */
+	flush_workqueue(plat_priv->event_wq);
+
 	cnss_bus_dev_shutdown(plat_priv);
 	cnss_bus_dev_ramdump(plat_priv);
 	msleep(RECOVERY_DELAY_MS);
@@ -1081,8 +1130,33 @@ void cnss_device_crashed(struct device *dev)
 	if (!plat_priv)
 		return;
 
-	set_bit(CNSS_DRIVER_RECOVERY, &plat_priv->driver_state);
-	schedule_work(&plat_priv->recovery_work);
+	/*
+	 * RACE2 FIX: route unsolicited crash notifications through event_wq.
+	 *
+	 * The old path: set CNSS_DRIVER_RECOVERY + schedule_work() immediately.
+	 * cnss_recovery_work_handler() would run on system_wq concurrently with
+	 * event_wq processing new-firmware QMI events (SERVER_ARRIVE → BDF
+	 * download → FW_READY handshake).  The system_wq shutdown preempted the
+	 * event_wq init and killed the new firmware mid-handshake → crash loop.
+	 *
+	 * When CNSS_DRIVER_RECOVERY is already set we are being called from
+	 * within the recovery event path (cnss_driver_recovery_hdlr →
+	 * cnss_do_recovery → cnss_bus_device_crashed → here).  In that case
+	 * the RECOVERY event is already being processed on event_wq so we must
+	 * NOT re-post it — just proceed with schedule_work() as before.
+	 *
+	 * When CNSS_DRIVER_RECOVERY is NOT set this is an unsolicited,
+	 * externally-triggered crash.  Route it through cnss_schedule_recovery()
+	 * so the RECOVERY event is serialized on event_wq behind any pending
+	 * QMI events.  cnss_driver_recovery_hdlr() will set CNSS_DRIVER_RECOVERY
+	 * and eventually call back here (with the bit already set) to schedule
+	 * the actual work.
+	 */
+	if (test_bit(CNSS_DRIVER_RECOVERY, &plat_priv->driver_state)) {
+		schedule_work(&plat_priv->recovery_work);
+	} else {
+		cnss_schedule_recovery(dev, CNSS_REASON_DEFAULT);
+	}
 }
 EXPORT_SYMBOL(cnss_device_crashed);
 #endif /* CONFIG_MSM_SUBSYSTEM_RESTART */
@@ -1228,6 +1302,19 @@ static int cnss_driver_recovery_hdlr(struct cnss_plat_data *plat_priv,
 		if (!test_bit(CNSS_FW_READY, &plat_priv->driver_state)) {
 			set_bit(CNSS_FW_BOOT_RECOVERY,
 				&plat_priv->driver_state);
+		} else if (recovery_data->reason == CNSS_REASON_TIMEOUT) {
+			/*
+			 * RACE1 FIX (event-queue path): the fw_boot_timer fired
+			 * and posted CNSS_REASON_TIMEOUT to event_wq, but the
+			 * FW_READY event was already ahead of it in the FIFO queue
+			 * and was processed first.  By the time we arrive here,
+			 * CNSS_FW_READY is set — meaning the firmware came up
+			 * successfully.  The timeout is stale; triggering recovery
+			 * now would tear down a live, working session.
+			 */
+			cnss_pr_dbg("RACE1-FIX: FW_READY already set, dropping stale timeout recovery\n");
+			kfree(data);
+			return 0;
 		}
 		break;
 	}
@@ -1663,7 +1750,7 @@ static void cnss_driver_event_work(struct work_struct *work)
 			ret = cnss_wlfw_server_arrive(plat_priv, event->data);
 			break;
 		case CNSS_DRIVER_EVENT_SERVER_EXIT:
-			ret = cnss_wlfw_server_exit(plat_priv);
+			ret = cnss_wlfw_server_exit(plat_priv, event->data);
 			break;
 		case CNSS_DRIVER_EVENT_REQUEST_MEM:
 			ret = cnss_bus_alloc_fw_mem(plat_priv);

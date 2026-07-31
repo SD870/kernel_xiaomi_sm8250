@@ -1044,8 +1044,21 @@ int cnss_wlfw_wlan_mode_send_sync(struct cnss_plat_data *plat_priv,
 	if (!plat_priv)
 		return -ENODEV;
 
-	if (mode == CNSS_MISSION && plat_priv->use_nv_mac)
-		cnss_wait_for_wlfw_mac_ready(plat_priv);
+	if (mode == CNSS_MISSION && plat_priv->use_nv_mac) {
+		if (!test_bit(CNSS_COEX_CONNECTED, &plat_priv->driver_state)) {
+			/*
+			 * pipa (WiFi-only): no modem COEX service present.
+			 * Firmware selects its own NV MAC independently; the
+			 * 200×50 ms poll returns NOT_SUPPORTED on this platform.
+			 * Explicitly disable use_nv_mac and continue — MAC layer
+			 * will be ready without the driver polling for it.
+			 */
+			cnss_pr_info("MAC-FIX: no COEX, disabling nv_mac poll (continuing)\n");
+			plat_priv->use_nv_mac = 0;
+		} else {
+			cnss_wait_for_wlfw_mac_ready(plat_priv);
+		}
+	}
 
 	cnss_pr_dbg("Sending mode message, mode: %s(%d), state: 0x%lx\n",
 		    cnss_qmi_mode_to_str(mode), mode, plat_priv->driver_state);
@@ -2328,6 +2341,12 @@ static int cnss_wlfw_connect_to_server(struct cnss_plat_data *plat_priv,
 		goto out;
 	}
 
+	/* Remember which server instance we connected to so that a stale
+	 * wlfw_del_server() for the previous firmware session can be
+	 * detected and ignored in cnss_wlfw_server_exit().              */
+	plat_priv->wlfw_active_node = event_data->node;
+	plat_priv->wlfw_active_port = event_data->port;
+
 	set_bit(CNSS_QMI_WLFW_CONNECTED, &plat_priv->driver_state);
 
 	cnss_pr_info("QMI WLFW service connected, state: 0x%lx\n",
@@ -2354,8 +2373,16 @@ int cnss_wlfw_server_arrive(struct cnss_plat_data *plat_priv, void *data)
 		return -EINVAL;
 	}
 
-	if (test_bit(CNSS_IN_REBOOT, &plat_priv->driver_state)) {
-		cnss_pr_err("WLFW server will exit on shutdown\n");
+	/*
+	 * BUG FIX: original guard blocks WLFW server arrive for any
+	 * CNSS_IN_REBOOT state, but the AIDL HAL restarts its QMI session
+	 * more aggressively; CNSS_IN_REBOOT may not be cleared in time.
+	 * Only block on a true shutdown (not an HAL reconnect during recovery).
+	 */
+	if (test_bit(CNSS_IN_REBOOT, &plat_priv->driver_state) &&
+	    !test_bit(CNSS_DRIVER_RECOVERY, &plat_priv->driver_state)) {
+		cnss_pr_err("WLFW server arrive blocked: shutdown in progress state=0x%lx\n",
+			    plat_priv->driver_state);
 		return -EINVAL;
 	}
 
@@ -2382,12 +2409,53 @@ out:
 	return ret;
 }
 
-int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv)
+int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv, void *data)
 {
+	struct cnss_qmi_event_server_exit_data *exit_data = data;
 	int ret;
 
 	if (!plat_priv)
 		return -ENODEV;
+
+	/*
+	 * Stale-exit guard
+	 * -----------------
+	 * A wlfw_del_server() notification for the *old* firmware session
+	 * can arrive in the IPC-router kthread after the *new* firmware has
+	 * already come up and completed the QMI handshake (SERVER_ARRIVE
+	 * processed first, CNSS_QMI_WLFW_CONNECTED already set, boot
+	 * sequence in progress).  Processing this stale SERVER_EXIT would
+	 * call cnss_qmi_deinit() on the live handle, causing the in-flight
+	 * cnss_wlfw_respond_mem_send_sync() to fail and leaving the firmware
+	 * stuck waiting for the memory response.
+	 *
+	 * Detection: after a successful connect, plat_priv->wlfw_active_node
+	 * and wlfw_active_port hold the IPC-router address of the server we
+	 * are talking to.  Each firmware restart gets a new port from the
+	 * IPC router, so a dying server with a different port than the one
+	 * currently connected is unambiguously stale.
+	 *
+	 * When stale: clear CNSS_QMI_DEL_SERVER (which wlfw_del_server set)
+	 * and re-enable QMI error reporting so the active session continues
+	 * uninterrupted.  The next legitimate exit for the active server
+	 * will still be processed correctly because its port will match.
+	 */
+	if (exit_data &&
+	    test_bit(CNSS_QMI_WLFW_CONNECTED, &plat_priv->driver_state) &&
+	    (exit_data->node != plat_priv->wlfw_active_node ||
+	     exit_data->port != plat_priv->wlfw_active_port)) {
+		cnss_pr_info("SERVER_EXIT stale: dying=%u:%u active=%u:%u state=0x%lx — skipping deinit\n",
+			     exit_data->node, exit_data->port,
+			     plat_priv->wlfw_active_node,
+			     plat_priv->wlfw_active_port,
+			     plat_priv->driver_state);
+		kfree(exit_data);
+		clear_bit(CNSS_QMI_DEL_SERVER, &plat_priv->driver_state);
+		cnss_ignore_qmi_failure(false);
+		return 0;
+	}
+
+	kfree(exit_data);
 
 	clear_bit(CNSS_QMI_WLFW_CONNECTED, &plat_priv->driver_state);
 
@@ -2397,6 +2465,8 @@ int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv)
 	cnss_qmi_deinit(plat_priv);
 
 	clear_bit(CNSS_QMI_DEL_SERVER, &plat_priv->driver_state);
+	plat_priv->wlfw_active_node = 0;
+	plat_priv->wlfw_active_port = 0;
 
 	ret = cnss_qmi_init(plat_priv);
 	if (ret < 0) {
@@ -2413,12 +2483,26 @@ static int wlfw_new_server(struct qmi_handle *qmi_wlfw,
 		container_of(qmi_wlfw, struct cnss_plat_data, qmi_wlfw);
 	struct cnss_qmi_event_server_arrive_data *event_data;
 
+	/*
+	 * RACE FIX: do NOT drop SERVER_ARRIVE when CNSS_QMI_DEL_SERVER is
+	 * set.  The old guard caused a WiFi-toggle failure: wlfw_del_server()
+	 * sets CNSS_QMI_DEL_SERVER in the IPC-router kthread immediately,
+	 * but the event worker clears it only after processing SERVER_EXIT
+	 * (which can be delayed by the work queue).  If the new firmware's
+	 * wlfw_new_server() fires during that window the SERVER_ARRIVE was
+	 * silently dropped, leaving the QMI session without a peer even
+	 * after a successful firmware restart — WiFi never came back.
+	 *
+	 * Safety: the event queue is FIFO (SERVER_EXIT is always posted
+	 * before SERVER_ARRIVE for a given firmware restart), so the exit
+	 * is always processed first.  The CNSS_QMI_WLFW_CONNECTED check in
+	 * cnss_wlfw_server_arrive() already prevents double-connects.
+	 * Simply posting the arrive unconditionally is therefore correct.
+	 */
 	if (plat_priv && test_bit(CNSS_QMI_DEL_SERVER,
-				  &plat_priv->driver_state)) {
-		cnss_pr_info("WLFW server delete in progress, Ignore server arrive, state: 0x%lx\n",
-			     plat_priv->driver_state);
-		return 0;
-	}
+				  &plat_priv->driver_state))
+		cnss_pr_dbg("WLFW server arrive while del in progress — posting anyway (FIFO queue), state: 0x%lx\n",
+			    plat_priv->driver_state);
 
 	cnss_pr_dbg("WLFW server arriving: node %u port %u\n",
 		    service->node, service->port);
@@ -2441,6 +2525,7 @@ static void wlfw_del_server(struct qmi_handle *qmi_wlfw,
 {
 	struct cnss_plat_data *plat_priv =
 		container_of(qmi_wlfw, struct cnss_plat_data, qmi_wlfw);
+	struct cnss_qmi_event_server_exit_data *exit_data;
 
 	if (plat_priv && test_bit(CNSS_QMI_DEL_SERVER,
 				  &plat_priv->driver_state)) {
@@ -2451,13 +2536,19 @@ static void wlfw_del_server(struct qmi_handle *qmi_wlfw,
 
 	cnss_pr_dbg("WLFW server exiting\n");
 
-	if (plat_priv) {
+	if (plat_priv && service) {
 		cnss_ignore_qmi_failure(true);
 		set_bit(CNSS_QMI_DEL_SERVER, &plat_priv->driver_state);
 	}
 
+	exit_data = kzalloc(sizeof(*exit_data), GFP_ATOMIC);
+	if (exit_data && service) {
+		exit_data->node = service->node;
+		exit_data->port = service->port;
+	}
+
 	cnss_driver_event_post(plat_priv, CNSS_DRIVER_EVENT_SERVER_EXIT,
-			       0, NULL);
+			       0, exit_data);
 }
 
 static struct qmi_ops qmi_wlfw_ops = {
