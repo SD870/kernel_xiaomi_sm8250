@@ -371,6 +371,11 @@ struct cnss_plat_data {
 	struct workqueue_struct *event_wq;
 	struct work_struct recovery_work;
 	struct qmi_handle qmi_wlfw;
+	/* IPC-router address of the WLFW server we are currently connected
+	 * to; updated on every successful cnss_wlfw_connect_to_server().
+	 * Used to detect stale wlfw_del_server() notifications.         */
+	unsigned int wlfw_active_node;
+	unsigned int wlfw_active_port;
 	struct wlfw_rf_chip_info chip_info;
 	struct wlfw_rf_board_info board_info;
 	struct wlfw_soc_info soc_info;

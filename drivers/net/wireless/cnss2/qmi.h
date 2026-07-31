@@ -13,6 +13,11 @@ struct cnss_qmi_event_server_arrive_data {
 	unsigned int port;
 };
 
+struct cnss_qmi_event_server_exit_data {
+	unsigned int node;
+	unsigned int port;
+};
+
 #define QDSS_TRACE_SEG_LEN_MAX 32
 #define QDSS_TRACE_FILE_NAME_MAX 16
 
@@ -37,7 +42,7 @@ int cnss_qmi_init(struct cnss_plat_data *plat_priv);
 void cnss_qmi_deinit(struct cnss_plat_data *plat_priv);
 unsigned int cnss_get_qmi_timeout(struct cnss_plat_data *plat_priv);
 int cnss_wlfw_server_arrive(struct cnss_plat_data *plat_priv, void *data);
-int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv);
+int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv, void *data);
 int cnss_wlfw_respond_mem_send_sync(struct cnss_plat_data *plat_priv);
 int cnss_wlfw_tgt_cap_send_sync(struct cnss_plat_data *plat_priv);
 int cnss_wlfw_bdf_dnld_send_sync(struct cnss_plat_data *plat_priv,
@@ -96,7 +101,8 @@ static inline int cnss_wlfw_server_arrive(struct cnss_plat_data *plat_priv,
 	return 0;
 }
 
-static inline int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv)
+static inline int cnss_wlfw_server_exit(struct cnss_plat_data *plat_priv,
+					void *data __maybe_unused)
 {
 	return 0;
 }
