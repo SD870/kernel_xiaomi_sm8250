@@ -3618,6 +3618,19 @@ void cnss_pci_fw_boot_timeout_hdlr(struct cnss_pci_data *pci_priv)
 		return;
 	}
 
+	/*
+	 * RACE1 FIX (fast path): FW_READY and the boot timer can fire on
+	 * different CPUs.  cnss_fw_ready_hdlr() calls del_timer() which
+	 * returns immediately if the timer has already fired — it does NOT
+	 * wait for this callback to finish.  If CNSS_FW_READY is already
+	 * set here, the FW_READY event was processed before we ran; posting
+	 * a RECOVERY would kill the firmware that just came up cleanly.
+	 */
+	if (test_bit(CNSS_FW_READY, &plat_priv->driver_state)) {
+		cnss_pr_dbg("FW already reached READY state, ignoring stale boot timer\n");
+		return;
+	}
+
 	cnss_schedule_recovery(&pci_priv->pci_dev->dev,
 			       CNSS_REASON_TIMEOUT);
 }
