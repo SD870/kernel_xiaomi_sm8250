@@ -300,7 +300,7 @@ static int maple_init_queue(struct request_queue *q, struct elevator_type *e)
 		return -ENOMEM;
 
 	/* Allocate structure */
-	mdata = kmalloc_node(sizeof(*mdata), GFP_KERNEL, q->node);
+	mdata = kzalloc_node(sizeof(*mdata), GFP_KERNEL, q->node);
 	if (!mdata) {
 		kobject_put(&eq->kobj);
 		return -ENOMEM;
